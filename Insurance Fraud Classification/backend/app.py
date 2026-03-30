@@ -1,6 +1,7 @@
 """
 FastAPI backend for Insurance Fraud Detection.
 Loads the pre-trained XGBoost model and scaler, exposes a /predict endpoint.
+Extended with training and analysis endpoints.
 """
 
 import pickle
@@ -8,10 +9,18 @@ import os
 import io
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from typing import Dict, Any, List
+import sys
+sys.path.append('..')
+
+from data_utils import load_data, preprocess_data, scale_features, get_categorical_mappings
+from model_utils import (split_data, train_knn, train_logistic_regression, train_decision_tree,
+                         train_random_forest, train_xgboost, evaluate_model, save_model_artifacts)
+from visualization_utils import setup_plot_style
 
 # ── Load artifacts (resolve paths relative to this file) ──────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -243,8 +252,111 @@ async def predict_csv(file: UploadFile = File(...)):
     df_result.to_csv(output, index=False)
     output.seek(0)
 
-    return StreamingResponse(
-        io.BytesIO(output.getvalue().encode()),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=predictions.csv"},
-    )
+@app.post("/train-model")
+def train_model(model_type: str = "xgboost", test_size: float = 0.2):
+    """Train a machine learning model on the dataset."""
+    try:
+        # Load and preprocess data
+        df = load_data("../insurance_claims.csv")
+        X, y, le_sex, feature_names = preprocess_data(df)
+        X_train, X_test, y_train, y_test = split_data(X, y, test_size=test_size)
+        X_train_scaled, X_test_scaled, scaler = scale_features(X_train, X_test)
+
+        # Get categorical mappings
+        cat_cols = df.select_dtypes(include="object").columns.tolist()
+        cat_mappings = get_categorical_mappings(df, cat_cols, feature_names)
+
+        # Train model based on type
+        if model_type == "knn":
+            model = train_knn(X_train_scaled, y_train)
+        elif model_type == "logistic":
+            model = train_logistic_regression(X_train_scaled, y_train)
+        elif model_type == "decision_tree":
+            model = train_decision_tree(X_train_scaled, y_train)
+        elif model_type == "random_forest":
+            model = train_random_forest(X_train_scaled, y_train)
+        elif model_type == "xgboost":
+            model = train_xgboost(X_train_scaled, y_train)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid model type")
+
+        # Evaluate model
+        metrics = evaluate_model(model, X_test_scaled, y_test)
+
+        # Save artifacts
+        save_model_artifacts(model, scaler, le_sex, feature_names, cat_mappings)
+
+        return {
+            "model_type": model_type,
+            "metrics": metrics,
+            "status": "Model trained and saved successfully"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/model-metrics")
+def get_model_metrics():
+    """Get evaluation metrics for the current model."""
+    try:
+        # Load test data
+        df = load_data("../insurance_claims.csv")
+        X, y, le_sex, feature_names = preprocess_data(df)
+        X_train, X_test, y_train, y_test = split_data(X, y)
+        X_train_scaled, X_test_scaled, scaler = scale_features(X_train, X_test)
+
+        # Evaluate current model
+        metrics = evaluate_model(model, X_test_scaled, y_test)
+        return metrics
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/data-summary")
+def get_data_summary():
+    """Get summary statistics of the dataset."""
+    try:
+        df = load_data("../insurance_claims.csv")
+
+        summary = {
+            "shape": df.shape,
+            "columns": df.columns.tolist(),
+            "dtypes": df.dtypes.astype(str).to_dict(),
+            "missing_values": df.isnull().sum().to_dict(),
+            "numerical_stats": df.describe().to_dict(),
+            "categorical_counts": {col: df[col].value_counts().to_dict()
+                                 for col in df.select_dtypes(include='object').columns}
+        }
+
+        return summary
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze-features")
+def analyze_features():
+    """Perform feature analysis and return insights."""
+    try:
+        df = load_data("../insurance_claims.csv")
+        X, y, le_sex, feature_names = preprocess_data(df)
+
+        # Correlation with target
+        correlations = X.corrwith(y).abs().sort_values(ascending=False).head(10).to_dict()
+
+        # Feature importance from current model (if tree-based)
+        feature_importance = {}
+        if hasattr(model, 'feature_importances_'):
+            importance = model.feature_importances_
+            top_indices = np.argsort(importance)[-10:]
+            feature_importance = {feature_names[i]: float(importance[i]) for i in top_indices}
+
+        return {
+            "correlations_with_target": correlations,
+            "feature_importance": feature_importance
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
